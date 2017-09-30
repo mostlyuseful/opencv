@@ -42,6 +42,8 @@
 #include "precomp.hpp"
 #include <list>
 #include <map>
+#include <deque>
+#include <set>
 #include <string>
 #include <sstream>
 #include <iostream> // std::cerr
@@ -64,67 +66,6 @@
 #   define LOG_BUFFER_POOL(...)
 # endif
 #endif
-
-
-// TODO Move to some common place
-static bool getBoolParameter(const char* name, bool defaultValue)
-{
-/*
- * If your system doesn't support getenv(), define NO_GETENV to disable
- * this feature.
- */
-#ifdef NO_GETENV
-    const char* envValue = NULL;
-#else
-    const char* envValue = getenv(name);
-#endif
-    if (envValue == NULL)
-    {
-        return defaultValue;
-    }
-    cv::String value = envValue;
-    if (value == "1" || value == "True" || value == "true" || value == "TRUE")
-    {
-        return true;
-    }
-    if (value == "0" || value == "False" || value == "false" || value == "FALSE")
-    {
-        return false;
-    }
-    CV_ErrorNoReturn(cv::Error::StsBadArg, cv::format("Invalid value for %s parameter: %s", name, value.c_str()));
-}
-
-
-// TODO Move to some common place
-static size_t getConfigurationParameterForSize(const char* name, size_t defaultValue)
-{
-#ifdef NO_GETENV
-    const char* envValue = NULL;
-#else
-    const char* envValue = getenv(name);
-#endif
-    if (envValue == NULL)
-    {
-        return defaultValue;
-    }
-    cv::String value = envValue;
-    size_t pos = 0;
-    for (; pos < value.size(); pos++)
-    {
-        if (!isdigit(value[pos]))
-            break;
-    }
-    cv::String valueStr = value.substr(0, pos);
-    cv::String suffixStr = value.substr(pos, value.length() - pos);
-    int v = atoi(valueStr.c_str());
-    if (suffixStr.length() == 0)
-        return v;
-    else if (suffixStr == "MB" || suffixStr == "Mb" || suffixStr == "mb")
-        return v * 1024 * 1024;
-    else if (suffixStr == "KB" || suffixStr == "Kb" || suffixStr == "kb")
-        return v * 1024;
-    CV_ErrorNoReturn(cv::Error::StsBadArg, cv::format("Invalid value for %s parameter: %s", name, value.c_str()));
-}
 
 #if CV_OPENCL_SHOW_SVM_LOG
 // TODO add timestamp logging
@@ -159,7 +100,7 @@ static bool isRaiseError()
     static bool value = false;
     if (!initialized)
     {
-        value = getBoolParameter("OPENCV_OPENCL_RAISE_ERROR", false);
+        value = cv::utils::getConfigurationParameterBool("OPENCV_OPENCL_RAISE_ERROR", false);
         initialized = true;
     }
     return value;
@@ -233,24 +174,6 @@ static uint64 crc64( const uchar* data, size_t size, uint64 crc0=0 )
 
     return ~crc;
 }
-
-struct HashKey
-{
-    typedef uint64 part;
-    HashKey(part _a, part _b) : a(_a), b(_b) {}
-    part a, b;
-};
-
-inline bool operator == (const HashKey& h1, const HashKey& h2)
-{
-    return h1.a == h2.a && h1.b == h2.b;
-}
-
-inline bool operator < (const HashKey& h1, const HashKey& h2)
-{
-    return h1.a < h2.a || (h1.a == h2.a && h1.b < h2.b);
-}
-
 
 bool haveOpenCL()
 {
@@ -596,6 +519,7 @@ struct Device::Impl
 
         name_ = getStrProp(CL_DEVICE_NAME);
         version_ = getStrProp(CL_DEVICE_VERSION);
+        extensions_ = getStrProp(CL_DEVICE_EXTENSIONS);
         doubleFPConfig_ = getProp<cl_device_fp_config, int>(CL_DEVICE_DOUBLE_FP_CONFIG);
         hostUnifiedMemory_ = getBoolProp(CL_DEVICE_HOST_UNIFIED_MEMORY);
         maxComputeUnits_ = getProp<cl_uint, int>(CL_DEVICE_MAX_COMPUTE_UNITS);
@@ -605,6 +529,20 @@ struct Device::Impl
 
         String deviceVersion_ = getStrProp(CL_DEVICE_VERSION);
         parseDeviceVersion(deviceVersion_, deviceVersionMajor_, deviceVersionMinor_);
+
+        size_t pos = 0;
+        while (pos < extensions_.size())
+        {
+            size_t pos2 = extensions_.find(' ', pos);
+            if (pos2 == String::npos)
+                pos2 = extensions_.size();
+            if (pos2 > pos)
+            {
+                std::string extensionName = extensions_.substr(pos, pos2 - pos);
+                extensions_set_.insert(extensionName);
+            }
+            pos = pos2 + 1;
+        }
 
         intelSubgroupsSupport_ = isExtensionSupported("cl_intel_subgroups");
 
@@ -647,23 +585,19 @@ struct Device::Impl
             sz < sizeof(buf) ? String(buf) : String();
     }
 
-    bool isExtensionSupported(const String& extensionName) const
+    bool isExtensionSupported(const std::string& extensionName) const
     {
-        bool ret = false;
-        size_t pos = getStrProp(CL_DEVICE_EXTENSIONS).find(extensionName);
-        if (pos != String::npos)
-        {
-            ret = true;
-        }
-        return ret;
+        return extensions_set_.count(extensionName) > 0;
     }
 
 
     IMPLEMENT_REFCOUNTABLE();
+
     cl_device_id handle;
 
     String name_;
     String version_;
+    std::string extensions_;
     int doubleFPConfig_;
     bool hostUnifiedMemory_;
     int maxComputeUnits_;
@@ -675,6 +609,8 @@ struct Device::Impl
     String vendorName_;
     int vendorID_;
     bool intelSubgroupsSupport_;
+
+    std::set<std::string> extensions_set_;
 };
 
 
@@ -729,7 +665,10 @@ String Device::name() const
 { return p ? p->name_ : String(); }
 
 String Device::extensions() const
-{ return p ? p->getStrProp(CL_DEVICE_EXTENSIONS) : String(); }
+{ return p ? String(p->extensions_) : String(); }
+
+bool Device::isExtensionSupported(const String& extensionName) const
+{ return p ? p->isExtensionSupported(extensionName) : false; }
 
 String Device::version() const
 { return p ? p->version_ : String(); }
@@ -822,16 +761,7 @@ bool Device::imageSupport() const
 
 bool Device::imageFromBufferSupport() const
 {
-    bool ret = false;
-    if (p)
-    {
-        size_t pos = p->getStrProp(CL_DEVICE_EXTENSIONS).find("cl_khr_image2d_from_buffer");
-        if (pos != String::npos)
-        {
-            ret = true;
-        }
-    }
-    return ret;
+    return p ? p->isExtensionSupported("cl_khr_image2d_from_buffer") : false;
 }
 
 uint Device::imagePitchAlignment() const
@@ -1232,7 +1162,7 @@ static bool checkForceSVMUmatUsage()
     static bool force = false;
     if (!initialized)
     {
-        force = getBoolParameter("OPENCV_OPENCL_SVM_FORCE_UMAT_USAGE", false);
+        force = utils::getConfigurationParameterBool("OPENCV_OPENCL_SVM_FORCE_UMAT_USAGE", false);
         initialized = true;
     }
     return force;
@@ -1243,7 +1173,7 @@ static bool checkDisableSVMUMatUsage()
     static bool force = false;
     if (!initialized)
     {
-        force = getBoolParameter("OPENCV_OPENCL_SVM_DISABLE_UMAT_USAGE", false);
+        force = utils::getConfigurationParameterBool("OPENCV_OPENCL_SVM_DISABLE_UMAT_USAGE", false);
         initialized = true;
     }
     return force;
@@ -1254,7 +1184,7 @@ static bool checkDisableSVM()
     static bool force = false;
     if (!initialized)
     {
-        force = getBoolParameter("OPENCV_OPENCL_SVM_DISABLE", false);
+        force = utils::getConfigurationParameterBool("OPENCV_OPENCL_SVM_DISABLE", false);
         initialized = true;
     }
     return force;
@@ -1285,7 +1215,7 @@ static size_t getProgramCountLimit()
     static size_t count = 0;
     if (!initialized)
     {
-        count = getConfigurationParameterForSize("OPENCV_OPENCL_PROGRAM_CACHE", 0);
+        count = utils::getConfigurationParameterSizeT("OPENCV_OPENCL_PROGRAM_CACHE", 0);
         initialized = true;
     }
     return count;
@@ -1411,7 +1341,7 @@ struct Context::Impl
                     const String& buildflags, String& errmsg)
     {
         size_t limit = getProgramCountLimit();
-        String key = Program::getPrefix(buildflags);
+        String key = cv::format("codehash=%08llx ", src.hash()) + Program::getPrefix(buildflags);
         {
             cv::AutoLock lock(program_cache_mutex);
             phash_t::iterator it = phash.find(key);
@@ -1458,6 +1388,23 @@ struct Context::Impl
         return prog;
     }
 
+    void unloadProg(Program& prog)
+    {
+        cv::AutoLock lock(program_cache_mutex);
+        for (CacheList::iterator i = cacheList.begin(); i != cacheList.end(); ++i)
+        {
+              phash_t::iterator it = phash.find(*i);
+              if (it != phash.end())
+              {
+                  if (it->second.ptr() == prog.ptr())
+                  {
+                      phash.erase(*i);
+                      cacheList.erase(i);
+                      return;
+                  }
+              }
+        }
+    }
 
     IMPLEMENT_REFCOUNTABLE();
 
@@ -1721,7 +1668,11 @@ Program Context::getProg(const ProgramSource& prog,
     return p ? p->getProg(prog, buildopts, errmsg) : Program();
 }
 
-
+void Context::unloadProg(Program& prog)
+{
+    if (p)
+        p->unloadProg(prog);
+}
 
 #ifdef HAVE_OPENCL_SVM
 bool Context::useSVM() const
@@ -1889,9 +1840,35 @@ void initializeContextFromHandle(Context& ctx, void* platform, void* _context, v
 
 struct Queue::Impl
 {
-    Impl(const Context& c, const Device& d)
+    inline void __init()
     {
         refcount = 1;
+        handle = 0;
+        isProfilingQueue_ = false;
+    }
+
+    Impl(cl_command_queue q)
+    {
+        __init();
+        handle = q;
+
+        cl_command_queue_properties props = 0;
+        cl_int result = clGetCommandQueueInfo(handle, CL_QUEUE_PROPERTIES, sizeof(cl_command_queue_properties), &props, NULL);
+        CV_Assert(result && "clGetCommandQueueInfo(CL_QUEUE_PROPERTIES)");
+        isProfilingQueue_ = !!(props & CL_QUEUE_PROFILING_ENABLE);
+    }
+
+    Impl(cl_command_queue q, bool isProfilingQueue)
+    {
+        __init();
+        handle = q;
+        isProfilingQueue_ = isProfilingQueue;
+    }
+
+    Impl(const Context& c, const Device& d, bool withProfiling = false)
+    {
+        __init();
+
         const Context* pc = &c;
         cl_context ch = (cl_context)pc->ptr();
         if( !ch )
@@ -1903,8 +1880,10 @@ struct Queue::Impl
         if( !dh )
             dh = (cl_device_id)pc->device(0).ptr();
         cl_int retval = 0;
-        handle = clCreateCommandQueue(ch, dh, 0, &retval);
+        cl_command_queue_properties props = withProfiling ? CL_QUEUE_PROFILING_ENABLE : 0;
+        handle = clCreateCommandQueue(ch, dh, props, &retval);
         CV_OclDbgAssert(retval == CL_SUCCESS);
+        isProfilingQueue_ = withProfiling;
     }
 
     ~Impl()
@@ -1922,9 +1901,37 @@ struct Queue::Impl
         }
     }
 
+    const cv::ocl::Queue& getProfilingQueue(const cv::ocl::Queue& self)
+    {
+        if (isProfilingQueue_)
+            return self;
+
+        if (profiling_queue_.ptr())
+            return profiling_queue_;
+
+        cl_context ctx = 0;
+        CV_Assert(CL_SUCCESS == clGetCommandQueueInfo(handle, CL_QUEUE_CONTEXT, sizeof(cl_context), &ctx, NULL));
+
+        cl_device_id device = 0;
+        CV_Assert(CL_SUCCESS == clGetCommandQueueInfo(handle, CL_QUEUE_DEVICE, sizeof(cl_device_id), &device, NULL));
+
+        cl_int result = CL_SUCCESS;
+        cl_command_queue_properties props = CL_QUEUE_PROFILING_ENABLE;
+        cl_command_queue q = clCreateCommandQueue(ctx, device, props, &result);
+        CV_Assert(result == CL_SUCCESS && "clCreateCommandQueue(with CL_QUEUE_PROFILING_ENABLE)");
+
+        Queue queue;
+        queue.p = new Impl(q, true);
+        profiling_queue_ = queue;
+
+        return profiling_queue_;
+    }
+
     IMPLEMENT_REFCOUNTABLE();
 
     cl_command_queue handle;
+    bool isProfilingQueue_;
+    cv::ocl::Queue profiling_queue_;
 };
 
 Queue::Queue()
@@ -1978,6 +1985,12 @@ void Queue::finish()
     }
 }
 
+const Queue& Queue::getProfilingQueue() const
+{
+    CV_Assert(p);
+    return p->getProfilingQueue(*this);
+}
+
 void* Queue::ptr() const
 {
     return p ? p->handle : 0;
@@ -2023,7 +2036,7 @@ KernelArg KernelArg::Constant(const Mat& m)
 struct Kernel::Impl
 {
     Impl(const char* kname, const Program& prog) :
-        refcount(1), e(0), nu(0)
+        refcount(1), isInProgress(false), nu(0)
     {
         cl_program ph = (cl_program)prog.ptr();
         cl_int retval = 0;
@@ -2044,7 +2057,10 @@ struct Kernel::Impl
             if( u[i] )
             {
                 if( CV_XADD(&u[i]->urefcount, -1) == 1 )
+                {
+                    u[i]->flags |= UMatData::ASYNC_CLEANUP;
                     u[i]->currAllocator->deallocate(u[i]);
+                }
                 u[i] = 0;
             }
         nu = 0;
@@ -2066,13 +2082,20 @@ struct Kernel::Impl
         images.push_back(image);
     }
 
-    void finit()
+    void finit(cl_event e)
     {
+        CV_UNUSED(e);
+#if 0
+        printf("event::callback(%p)\n", e); fflush(stdout);
+#endif
         cleanupUMats();
         images.clear();
-        if(e) { clReleaseEvent(e); e = 0; }
+        isInProgress = false;
         release();
     }
+
+    bool run(int dims, size_t _globalsize[], size_t _localsize[],
+            bool sync, int64* timeNS, const Queue& q);
 
     ~Impl()
     {
@@ -2086,9 +2109,9 @@ struct Kernel::Impl
     cv::String name;
 #endif
     cl_kernel handle;
-    cl_event e;
     enum { MAX_ARRS = 16 };
     UMatData* u[MAX_ARRS];
+    bool isInProgress;
     int nu;
     std::list<Image2D> images;
     bool haveTempDstUMats;
@@ -2098,9 +2121,9 @@ struct Kernel::Impl
 
 extern "C" {
 
-static void CL_CALLBACK oclCleanupCallback(cl_event, cl_int, void *p)
+static void CL_CALLBACK oclCleanupCallback(cl_event e, cl_int, void *p)
 {
-    ((cv::ocl::Kernel::Impl*)p)->finit();
+    ((cv::ocl::Kernel::Impl*)p)->finit(e);
 }
 
 }
@@ -2214,7 +2237,7 @@ int Kernel::set(int i, const Image2D& image2D)
 
 int Kernel::set(int i, const UMat& m)
 {
-    return set(i, KernelArg(KernelArg::READ_WRITE, (UMat*)&m, 0, 0));
+    return set(i, KernelArg(KernelArg::READ_WRITE, (UMat*)&m));
 }
 
 int Kernel::set(int i, const KernelArg& arg)
@@ -2301,34 +2324,48 @@ int Kernel::set(int i, const KernelArg& arg)
     return i+1;
 }
 
-
 bool Kernel::run(int dims, size_t _globalsize[], size_t _localsize[],
                  bool sync, const Queue& q)
 {
-    CV_INSTRUMENT_REGION_OPENCL_RUN(p->name.c_str());
-
-    if(!p || !p->handle || p->e != 0)
+    if (!p)
         return false;
 
-    cl_command_queue qq = getQueue(q);
-    size_t offset[CV_MAX_DIM] = {0}, globalsize[CV_MAX_DIM] = {1,1,1};
+    size_t globalsize[CV_MAX_DIM] = {1,1,1};
     size_t total = 1;
-    CV_Assert(_globalsize != 0);
+    CV_Assert(_globalsize != NULL);
     for (int i = 0; i < dims; i++)
     {
         size_t val = _localsize ? _localsize[i] :
             dims == 1 ? 64 : dims == 2 ? (i == 0 ? 256 : 8) : dims == 3 ? (8>>(int)(i>0)) : 1;
         CV_Assert( val > 0 );
         total *= _globalsize[i];
-        globalsize[i] = ((_globalsize[i] + val - 1)/val)*val;
+        if (_globalsize[i] == 1)
+            val = 1;
+        globalsize[i] = divUp(_globalsize[i], (unsigned int)val) * val;
     }
-    if( total == 0 )
-        return true;
-    if( p->haveTempDstUMats )
+    CV_Assert(total > 0);
+
+    return p->run(dims, globalsize, _localsize, sync, NULL, q);
+}
+
+
+bool Kernel::Impl::run(int dims, size_t globalsize[], size_t localsize[],
+        bool sync, int64* timeNS, const Queue& q)
+{
+    CV_INSTRUMENT_REGION_OPENCL_RUN(p->name.c_str());
+
+    if (!handle || isInProgress)
+        return false;
+
+    cl_command_queue qq = getQueue(q);
+    if (haveTempDstUMats)
         sync = true;
-    cl_int retval = clEnqueueNDRangeKernel(qq, p->handle, (cl_uint)dims,
-                                           offset, globalsize, _localsize, 0, 0,
-                                           sync ? 0 : &p->e);
+    if (timeNS)
+        sync = true;
+    cl_event asyncEvent = 0;
+    cl_int retval = clEnqueueNDRangeKernel(qq, handle, (cl_uint)dims,
+                                           NULL, globalsize, localsize, 0, 0,
+                                           (sync && !timeNS) ? 0 : &asyncEvent);
 #if CV_OPENCL_SHOW_RUN_ERRORS
     if (retval != CL_SUCCESS)
     {
@@ -2336,26 +2373,45 @@ bool Kernel::run(int dims, size_t _globalsize[], size_t _localsize[],
         fflush(stdout);
     }
 #endif
-    if( sync || retval != CL_SUCCESS )
+    if (sync || retval != CL_SUCCESS)
     {
         CV_OclDbgAssert(clFinish(qq) == CL_SUCCESS);
-        p->cleanupUMats();
+        if (timeNS)
+        {
+            if (retval == CL_SUCCESS)
+            {
+                clWaitForEvents(1, &asyncEvent);
+                cl_ulong startTime, stopTime;
+                CV_Assert(CL_SUCCESS == clGetEventProfilingInfo(asyncEvent, CL_PROFILING_COMMAND_START, sizeof(startTime), &startTime, NULL));
+                CV_Assert(CL_SUCCESS == clGetEventProfilingInfo(asyncEvent, CL_PROFILING_COMMAND_END, sizeof(stopTime), &stopTime, NULL));
+                *timeNS = (int64)(stopTime - startTime);
+            }
+            else
+            {
+                *timeNS = -1;
+            }
+        }
+        cleanupUMats();
     }
     else
     {
-        p->addref();
-        CV_OclDbgAssert(clSetEventCallback(p->e, CL_COMPLETE, oclCleanupCallback, p) == CL_SUCCESS);
+        addref();
+        isInProgress = true;
+        CV_OclDbgAssert(clSetEventCallback(asyncEvent, CL_COMPLETE, oclCleanupCallback, this) == CL_SUCCESS);
     }
+    if (asyncEvent)
+        clReleaseEvent(asyncEvent);
     return retval == CL_SUCCESS;
 }
 
 bool Kernel::runTask(bool sync, const Queue& q)
 {
-    if(!p || !p->handle || p->e != 0)
+    if(!p || !p->handle || p->isInProgress)
         return false;
 
     cl_command_queue qq = getQueue(q);
-    cl_int retval = clEnqueueTask(qq, p->handle, 0, 0, sync ? 0 : &p->e);
+    cl_event asyncEvent = 0;
+    cl_int retval = clEnqueueTask(qq, p->handle, 0, 0, sync ? 0 : &asyncEvent);
     if( sync || retval != CL_SUCCESS )
     {
         CV_OclDbgAssert(clFinish(qq) == CL_SUCCESS);
@@ -2364,11 +2420,25 @@ bool Kernel::runTask(bool sync, const Queue& q)
     else
     {
         p->addref();
-        CV_OclDbgAssert(clSetEventCallback(p->e, CL_COMPLETE, oclCleanupCallback, p) == CL_SUCCESS);
+        p->isInProgress = true;
+        CV_OclDbgAssert(clSetEventCallback(asyncEvent, CL_COMPLETE, oclCleanupCallback, p) == CL_SUCCESS);
     }
+    if (asyncEvent)
+        clReleaseEvent(asyncEvent);
     return retval == CL_SUCCESS;
 }
 
+int64 Kernel::runProfiling(int dims, size_t globalsize[], size_t localsize[], const Queue& q_)
+{
+    CV_Assert(p && p->handle && !p->isInProgress);
+    Queue q = q_.ptr() ? q_ : Queue::getDefault();
+    CV_Assert(q.ptr());
+    q.finish(); // call clFinish() on base queue
+    Queue profilingQueue = q.getProfilingQueue();
+    int64 timeNs = -1;
+    bool res = p->run(dims, globalsize, localsize, true, &timeNs, profilingQueue);
+    return res ? timeNs : -1;
+}
 
 size_t Kernel::workGroupSize() const
 {
@@ -3195,16 +3265,20 @@ public:
     {
         size_t defaultPoolSize, poolSize;
         defaultPoolSize = ocl::Device::getDefault().isIntel() ? 1 << 27 : 0;
-        poolSize = getConfigurationParameterForSize("OPENCV_OPENCL_BUFFERPOOL_LIMIT", defaultPoolSize);
+        poolSize = utils::getConfigurationParameterSizeT("OPENCV_OPENCL_BUFFERPOOL_LIMIT", defaultPoolSize);
         bufferPool.setMaxReservedSize(poolSize);
-        poolSize = getConfigurationParameterForSize("OPENCV_OPENCL_HOST_PTR_BUFFERPOOL_LIMIT", defaultPoolSize);
+        poolSize = utils::getConfigurationParameterSizeT("OPENCV_OPENCL_HOST_PTR_BUFFERPOOL_LIMIT", defaultPoolSize);
         bufferPoolHostPtr.setMaxReservedSize(poolSize);
 #ifdef HAVE_OPENCL_SVM
-        poolSize = getConfigurationParameterForSize("OPENCV_OPENCL_SVM_BUFFERPOOL_LIMIT", defaultPoolSize);
+        poolSize = utils::getConfigurationParameterSizeT("OPENCV_OPENCL_SVM_BUFFERPOOL_LIMIT", defaultPoolSize);
         bufferPoolSVM.setMaxReservedSize(poolSize);
 #endif
 
         matStdAllocator = Mat::getDefaultAllocator();
+    }
+    ~OpenCLAllocator()
+    {
+        flushCleanupQueue();
     }
 
     UMatData* defaultAllocate(int dims, const int* sizes, int type, void* data, size_t* step,
@@ -3242,6 +3316,7 @@ public:
         }
 
         Context& ctx = Context::getDefault();
+        flushCleanupQueue();
 
         int createFlags = 0, flags0 = 0;
         getBestFlags(ctx, flags, usageFlags, createFlags, flags0);
@@ -3295,6 +3370,8 @@ public:
     {
         if(!u)
             return false;
+
+        flushCleanupQueue();
 
         UMatDataAutoLock lock(u);
 
@@ -3430,6 +3507,15 @@ public:
 
         CV_Assert(u->handle != 0);
         CV_Assert(u->mapcount == 0);
+
+        if (u->flags & UMatData::ASYNC_CLEANUP)
+            addToCleanupQueue(u);
+        else
+            deallocate_(u);
+    }
+
+    void deallocate_(UMatData* u) const
+    {
         if(u->tempUMat())
         {
             CV_Assert(u->origdata);
@@ -4233,6 +4319,33 @@ public:
     }
 
     MatAllocator* matStdAllocator;
+
+    mutable cv::Mutex cleanupQueueMutex;
+    mutable std::deque<UMatData*> cleanupQueue;
+
+    void flushCleanupQueue() const
+    {
+        if (!cleanupQueue.empty())
+        {
+            std::deque<UMatData*> q;
+            {
+                cv::AutoLock lock(cleanupQueueMutex);
+                q.swap(cleanupQueue);
+            }
+            for (std::deque<UMatData*>::const_iterator i = q.begin(); i != q.end(); ++i)
+            {
+                deallocate_(*i);
+            }
+        }
+    }
+    void addToCleanupQueue(UMatData* u) const
+    {
+        //TODO: Validation check: CV_Assert(!u->tempUMat());
+        {
+            cv::AutoLock lock(cleanupQueueMutex);
+            cleanupQueue.push_back(u);
+        }
+    }
 };
 
 MatAllocator* getOpenCLAllocator()
@@ -4980,7 +5093,7 @@ bool internal::isOpenCLForced()
     static bool value = false;
     if (!initialized)
     {
-        value = getBoolParameter("OPENCV_OPENCL_FORCE", false);
+        value = utils::getConfigurationParameterBool("OPENCV_OPENCL_FORCE", false);
         initialized = true;
     }
     return value;
@@ -4992,7 +5105,7 @@ bool internal::isPerformanceCheckBypassed()
     static bool value = false;
     if (!initialized)
     {
-        value = getBoolParameter("OPENCV_OPENCL_PERF_CHECK_BYPASS", false);
+        value = utils::getConfigurationParameterBool("OPENCV_OPENCL_PERF_CHECK_BYPASS", false);
         initialized = true;
     }
     return value;
